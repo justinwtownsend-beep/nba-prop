@@ -1,14 +1,12 @@
-import time
+ import time
 import json
 import difflib
 import unicodedata
-import re
-from io import StringIO
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 import requests
+from io import StringIO
 
 from nba_api.stats.endpoints import leaguedashplayerstats, playergamelog
 
@@ -20,34 +18,29 @@ LEAGUE_TIMEOUT = 20
 GAMELOG_TIMEOUT = 12
 GAMELOG_RETRIES = 2
 
-# One-sided 90% z-score: P(X >= floor)=0.90
 Z_ONE_SIDED_90 = 1.2815515655446004
 
-# Minimum game sample to compute σ reliably
 MIN_GAMES_FOR_VOL = 5
-
-# If projected minutes are bumped way up/down, cap scaling so we don't go crazy
 MIN_SCALE = 0.70
 MAX_SCALE = 1.30
+
+# Must match optimizer app gist filenames
+GIST_FINAL = "final.csv"
+GIST_OUT = "out.json"
 
 # ==========================
 # PAGE
 # ==========================
 st.set_page_config(layout="wide")
-st.title("DK Slate Props — 90% Confidence Floors (Minutes-Adjusted Volatility)")
+st.title("Props App — 90% Floors (Auto-load from Optimizer)")
 
 st.markdown(
     """
-Upload your **DraftKings salary slate CSV** and this app will:
+This app auto-loads your projections from the **Optimizer app** so you only mark OUT players once.
 
-1) Pull **this season** player game logs (NBA API)  
-2) Build **minutes-adjusted volatility** per stat (PTS/REB/AST/3PM)  
-3) Output a **90% floor** for each stat for each player on the slate  
-
-**Floor90** is a *one-sided* 90% floor:
-> a number the player is projected to exceed about **90%** of the time under this model.
-
-Minutes-adjusted = volatility scales with projected minutes (so injury-minute bumps matter).
+Workflow:
+1) In Optimizer app: Upload slate → mark OUT → Run Projections  
+2) Here: Load `final.csv` + `out.json` from the same Gist → Build 90% floors
 """
 )
 
@@ -90,23 +83,24 @@ def parse_minutes_min(x):
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
-# DK FP not needed in this app, but we keep this for possible extensions
-def dk_fp_from_stats_row(r):
-    pts = float(r["PTS"])
-    reb = float(r["REB"])
-    ast = float(r["AST"])
-    stl = float(r["STL"])
-    blk = float(r["BLK"])
-    tov = float(r["TOV"])
-    fg3m = float(r["FG3M"])
+# ==========================
+# GIST READ
+# ==========================
+def gh_headers(token: str):
+    return {"Authorization": f"token {token}"}
 
-    fp = pts + 1.25*reb + 1.5*ast + 2.0*stl + 2.0*blk - 0.5*tov + 0.5*fg3m
-    cats = sum([pts >= 10, reb >= 10, ast >= 10, stl >= 10, blk >= 10])
-    if cats >= 2:
-        fp += 1.5
-    if cats >= 3:
-        fp += 3.0
-    return fp
+def gist_read(gist_id: str, token: str, filename: str):
+    r = requests.get(f"https://api.github.com/gists/{gist_id}", headers=gh_headers(token), timeout=25)
+    r.raise_for_status()
+    g = r.json()
+    if filename not in g.get("files", {}):
+        return None
+    f = g["files"][filename]
+    if not f.get("truncated"):
+        return f.get("content")
+    rr = requests.get(f["raw_url"], timeout=25)
+    rr.raise_for_status()
+    return rr.text
 
 # ==========================
 # NBA DATA
@@ -119,57 +113,50 @@ def league_player_df():
         timeout=LEAGUE_TIMEOUT
     ).get_data_frames()[0]
 
-    keep = ["PLAYER_ID", "PLAYER_NAME", "MIN", "PTS", "REB", "AST", "FG3M"]
+    keep = ["PLAYER_ID", "PLAYER_NAME"]
     df = df[keep].copy()
-    df.columns = ["PLAYER_ID", "NBA_Name", "MIN", "PTS", "REB", "AST", "FG3M"]
-
+    df.columns = ["PLAYER_ID", "NBA_Name"]
     df["NBA_Name_clean"] = df["NBA_Name"].apply(clean_name)
     df["NBA_Name_stripped"] = df["NBA_Name"].apply(strip_suffix)
     df["NBA_Last"] = df["NBA_Name_clean"].apply(lambda x: x.split()[-1] if isinstance(x, str) and x.split() else "")
     return df
 
-def match_player_row(name: str, nba_df: pd.DataFrame):
+def match_player_id(name: str, nba_df: pd.DataFrame):
     cn = clean_name(name)
     sn = strip_suffix(name)
 
     exact = nba_df[nba_df["NBA_Name_clean"] == cn]
     if not exact.empty:
-        return exact.iloc[0]
+        return int(exact.iloc[0]["PLAYER_ID"])
 
     exact2 = nba_df[nba_df["NBA_Name_stripped"] == sn]
     if not exact2.empty:
-        return exact2.iloc[0]
+        return int(exact2.iloc[0]["PLAYER_ID"])
 
     parts = sn.split()
     if parts:
         last = parts[-1]
         cand = nba_df[nba_df["NBA_Last"] == last]
         if not cand.empty:
-            best_row, best_score = None, 0.0
+            best_id, best_score = None, 0.0
             for _, row in cand.iterrows():
                 score = difflib.SequenceMatcher(None, sn, row["NBA_Name_stripped"]).ratio()
                 if score > best_score:
                     best_score = score
-                    best_row = row
-            if best_row is not None and best_score >= 0.75:
-                return best_row
+                    best_id = int(row["PLAYER_ID"])
+            if best_id is not None and best_score >= 0.75:
+                return best_id
 
     hit = difflib.get_close_matches(cn, nba_df["NBA_Name_clean"].tolist(), n=1, cutoff=0.90)
     if hit:
-        return nba_df[nba_df["NBA_Name_clean"] == hit[0]].iloc[0]
-
+        return int(nba_df[nba_df["NBA_Name_clean"] == hit[0]].iloc[0]["PLAYER_ID"])
     return None
 
 @st.cache_data(ttl=3600)
 def player_rates_volatility(player_id: int, last_n: int):
     """
-    Pull last_n game logs and compute:
-      - avg_minutes (from sample)
-      - per-minute standard deviation for PTS/REB/AST/FG3M
-    We'll scale per-minute σ by projected minutes later.
-
-    Returns: dict with keys:
-      avg_min, pm_sigma_{stat}, games
+    Per-minute σ for PTS/REB/AST/FG3M from last_n games.
+    Returns avg_min for scaling.
     """
     last_err = None
     for attempt in range(1, GAMELOG_RETRIES + 1):
@@ -189,27 +176,18 @@ def player_rates_volatility(player_id: int, last_n: int):
             if gl.empty:
                 return None
 
-            # Ensure stats exist
             for c in ["PTS","REB","AST","FG3M"]:
                 if c not in gl.columns:
                     gl[c] = 0.0
                 gl[c] = pd.to_numeric(gl[c], errors="coerce").fillna(0.0)
-
-            # per-minute rates each game
-            for c in ["PTS","REB","AST","FG3M"]:
                 gl[f"PM_{c}"] = gl[c] / gl["MIN_f"]
 
             avg_min = float(gl["MIN_f"].mean())
             games = int(len(gl))
-
             out = {"avg_min": avg_min, "games": games}
-            for c in ["PTS","REB","AST","FG3M"]:
-                # ddof=1 if enough games; else 0
-                if games >= 2:
-                    out[f"pm_sigma_{c}"] = float(gl[f"PM_{c}"].std(ddof=1))
-                else:
-                    out[f"pm_sigma_{c}"] = 0.0
 
+            for c in ["PTS","REB","AST","FG3M"]:
+                out[f"pm_sigma_{c}"] = float(gl[f"PM_{c}"].std(ddof=1)) if games >= 2 else 0.0
             return out
         except Exception as e:
             last_err = str(e)
@@ -217,142 +195,126 @@ def player_rates_volatility(player_id: int, last_n: int):
     return None
 
 # ==========================
-# INPUT: DK SLATE
+# SIDEBAR
 # ==========================
-st.sidebar.subheader("Upload DK Slate")
-slate_file = st.sidebar.file_uploader("DraftKings salary slate CSV", type="csv")
+st.sidebar.subheader("Source")
+source = st.sidebar.radio("Load from:", ["Optimizer Gist (recommended)", "Upload projections CSV"], index=0)
 
-if not slate_file:
-    st.info("Upload your DraftKings slate CSV to begin.")
-    st.stop()
-
-slate_text = slate_file.getvalue().decode("utf-8", errors="ignore")
-df = pd.read_csv(StringIO(slate_text))
-
-# Minimal required columns
-required = ["Name", "Salary", "TeamAbbrev", "Position"]
-missing = [c for c in required if c not in df.columns]
-if missing:
-    st.error(f"DK CSV missing columns: {missing}")
-    st.stop()
-
-# Controls
 st.sidebar.markdown("---")
 st.sidebar.subheader("Volatility Settings")
-last_n = st.sidebar.slider("Use last N games for volatility", 5, 30, 15, 1)
+last_n = st.sidebar.slider("Use last N games", 5, 30, 15, 1)
 min_games = st.sidebar.slider("Minimum games required", 3, 15, 5, 1)
 min_sigma_pm = st.sidebar.slider("Minimum per-minute σ floor", 0.0, 0.50, 0.02, 0.01)
 
-st.sidebar.subheader("Minutes Source")
-minutes_mode = st.sidebar.radio(
-    "Projected minutes (μ minutes) source",
-    ["Use season avg minutes (NBA)", "Enter a constant minutes for all players"],
-    index=0
-)
-const_minutes = None
-if minutes_mode == "Enter a constant minutes for all players":
-    const_minutes = st.sidebar.number_input("Constant minutes", min_value=10.0, max_value=48.0, value=32.0, step=0.5)
+# ==========================
+# LOAD PROJECTIONS
+# ==========================
+proj = None
+out_set = set()
 
-run = st.button("Build 90% floors for slate")
+if source == "Optimizer Gist (recommended)":
+    if "GITHUB_TOKEN" not in st.secrets or "GIST_ID" not in st.secrets:
+        st.error("This mode requires GITHUB_TOKEN and GIST_ID in Streamlit secrets.")
+        st.stop()
 
-if not run:
-    st.dataframe(df.head(25), use_container_width=True)
+    final_text = gist_read(st.secrets["GIST_ID"], st.secrets["GITHUB_TOKEN"], GIST_FINAL)
+    if not final_text:
+        st.error("Could not load final.csv from Gist. Run projections in optimizer first.")
+        st.stop()
+
+    proj = pd.read_csv(StringIO(final_text))
+
+    out_text = gist_read(st.secrets["GIST_ID"], st.secrets["GITHUB_TOKEN"], GIST_OUT)
+    if out_text:
+        try:
+            out_flags = json.loads(out_text)
+            out_set = {k for k, v in out_flags.items() if v}
+        except Exception:
+            out_set = set()
+
+else:
+    up = st.sidebar.file_uploader("Upload projections CSV", type="csv")
+    if not up:
+        st.info("Upload a projections CSV to begin.")
+        st.stop()
+    proj_text = up.getvalue().decode("utf-8", errors="ignore")
+    proj = pd.read_csv(StringIO(proj_text))
+
+# Validate needed columns
+needed = ["Name", "Minutes", "PTS", "REB", "AST", "FG3M"]
+missing = [c for c in needed if c not in proj.columns]
+if missing:
+    st.error(f"Projections file missing required columns: {missing}")
+    st.stop()
+
+# Remove OUT players if they exist in projection file
+proj["Name_clean"] = proj["Name"].apply(clean_name)
+if out_set:
+    proj = proj[~proj["Name_clean"].isin(out_set)].copy()
+
+proj["Minutes"] = pd.to_numeric(proj["Minutes"], errors="coerce").fillna(0.0)
+
+st.subheader("Projections Loaded")
+st.dataframe(proj[["Name","Team","Opp","PrimaryPos","Salary","Minutes","PTS","REB","AST","FG3M"]].head(50), use_container_width=True)
+
+# ==========================
+# BUILD FLOORS
+# ==========================
+if not st.button("Build 90% floors for slate"):
     st.stop()
 
 nba_df = league_player_df()
 
-# Build slate list
-slate = pd.DataFrame({
-    "Name": df["Name"].astype(str),
-    "Salary": pd.to_numeric(df["Salary"], errors="coerce"),
-    "Team": df["TeamAbbrev"].astype(str).str.upper(),
-    "Position": df["Position"].astype(str),
-})
-slate["Name_clean"] = slate["Name"].apply(clean_name)
-
-# Output rows
 rows = []
-prog = st.progress(0, text="Pulling game logs & computing minutes-adjusted volatility...")
+progbar = st.progress(0, text="Computing minutes-adjusted volatility...")
 
-for i, r in slate.iterrows():
-    name = r["Name"]
-    prog.progress((i + 1) / len(slate), text=f"{name} ({i+1}/{len(slate)})")
+for i, r in proj.iterrows():
+    name = str(r["Name"])
+    progbar.progress((i + 1) / len(proj), text=f"{name} ({i+1}/{len(proj)})")
 
-    hit = match_player_row(name, nba_df)
-    if hit is None:
-        rows.append({
-            "Name": name,
-            "Team": r["Team"],
-            "Pos": r["Position"],
-            "Salary": r["Salary"],
-            "Status": "ERR_NAME",
-            "Notes": "Could not match name to NBA player"
-        })
+    pid = match_player_id(name, nba_df)
+    if pid is None:
+        rows.append({"Name": name, "Status": "ERR_NAME", "Notes": "Could not match name"})
         continue
 
-    pid = int(hit["PLAYER_ID"])
-
-    # Projected minutes (μ minutes)
-    if minutes_mode == "Enter a constant minutes for all players":
-        mu_min = float(const_minutes)
-        min_note = "MIN:CONST"
-    else:
-        mu_min = float(hit["MIN"]) if pd.notna(hit["MIN"]) else np.nan
-        min_note = "MIN:NBA"
-
-    # Season per-minute means (μ stat rates)
-    # We'll use season per-game and season minutes to get per-minute rates, then multiply by mu_min
-    season_min = float(hit["MIN"]) if pd.notna(hit["MIN"]) else np.nan
-    if not np.isfinite(season_min) or season_min <= 0:
-        rows.append({
-            "Name": name,
-            "Team": r["Team"],
-            "Pos": r["Position"],
-            "Salary": r["Salary"],
-            "Status": "ERR_MIN",
-            "Notes": "No season minutes from NBA"
-        })
+    mu_min = float(r["Minutes"]) if np.isfinite(r["Minutes"]) else 0.0
+    if mu_min <= 0:
+        rows.append({"Name": name, "Status": "ERR_MIN", "Notes": "No projected minutes"})
         continue
 
-    mu = {}
-    for stat in ["PTS","REB","AST","FG3M"]:
-        mu_rate = float(hit[stat]) / season_min
-        mu[stat] = mu_rate * mu_min
+    # mean projections from optimizer app
+    mu = {
+        "PTS": float(r["PTS"]),
+        "REB": float(r["REB"]),
+        "AST": float(r["AST"]),
+        "FG3M": float(r["FG3M"]),
+    }
 
-    # Pull per-minute volatility from game logs
     vol = player_rates_volatility(pid, last_n=last_n)
     if vol is None or vol.get("games", 0) < int(min_games):
-        rows.append({
-            "Name": name,
-            "Team": r["Team"],
-            "Pos": r["Position"],
-            "Salary": r["Salary"],
-            "Status": "ERR_LOGS",
-            "Notes": f"Not enough game logs for volatility (need {min_games})"
-        })
+        rows.append({"Name": name, "Status": "ERR_LOGS", "Notes": f"Need >= {min_games} games for σ"})
         continue
 
-    avg_min_sample = float(vol["avg_min"]) if vol.get("avg_min") else season_min
+    avg_min_sample = float(vol["avg_min"]) if vol.get("avg_min") else mu_min
     scale = clamp(mu_min / max(avg_min_sample, 1e-6), MIN_SCALE, MAX_SCALE)
 
     out = {
         "Name": name,
-        "Team": r["Team"],
-        "Pos": r["Position"],
-        "Salary": r["Salary"],
+        "Team": r.get("Team",""),
+        "Opp": r.get("Opp",""),
+        "PrimaryPos": r.get("PrimaryPos",""),
+        "Salary": r.get("Salary", np.nan),
         "ProjMin": round(mu_min, 2),
         "VolGames": int(vol["games"]),
         "Status": "OK",
-        "Notes": f"{min_note} VOL(last{last_n}) scale={scale:.2f}"
+        "Notes": f"VOL(last{last_n}) scale={scale:.2f}"
     }
 
     for stat in ["PTS","REB","AST","FG3M"]:
         pm_sigma = float(vol.get(f"pm_sigma_{stat}", 0.0))
         pm_sigma = max(pm_sigma, float(min_sigma_pm))
 
-        # Minutes-adjusted sigma: scale per-minute σ by sqrt(minutes) and a minutes scaling factor
-        # - sqrt(mu_min) treats the stat as "accumulating" over minutes
-        # - scale adjusts for changes in role/minutes vs sample average
+        # minutes-adjusted σ: per-minute σ scaled by sqrt(minutes) and role-change scale
         sigma = pm_sigma * np.sqrt(mu_min) * scale
 
         floor90 = float(mu[stat]) - Z_ONE_SIDED_90 * float(sigma)
@@ -365,21 +327,17 @@ for i, r in slate.iterrows():
 
 props = pd.DataFrame(rows)
 
-st.subheader("90% Floors for Slate (PTS / REB / AST / 3PM)")
-st.dataframe(
-    props.sort_values(["Status", "Salary"], ascending=[True, False]),
-    use_container_width=True
-)
+st.subheader("90% Floors (Auto from Optimizer Projections)")
+st.dataframe(props, use_container_width=True)
 
 csv_bytes = props.to_csv(index=False).encode("utf-8")
 st.download_button(
-    "Download 90% floors CSV",
+    "Download floors CSV",
     data=csv_bytes,
-    file_name="dk_slate_props_floor90.csv",
+    file_name="props_floor90_from_optimizer.csv",
     mime="text/csv"
 )
 
 st.caption(
-    "Floor90 is a one-sided 90% floor: projected to exceed that stat about 90% of the time under this model. "
-    "Volatility is minutes-adjusted using per-minute σ from recent games."
+    "These floors use your optimizer projections as the mean (μ) and minutes-adjusted volatility (σ) from recent games."
 )
