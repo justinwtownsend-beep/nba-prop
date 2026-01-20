@@ -7,42 +7,41 @@ import pandas as pd
 import streamlit as st
 import requests
 from io import StringIO
-
 from nba_api.stats.endpoints import leaguedashplayerstats, playergamelog
 
 # ==========================
 # CONFIG
 # ==========================
 SEASON = "2025-26"
+GIST_FINAL = "final.csv"
+GIST_OUT = "out.json"
+
 LEAGUE_TIMEOUT = 20
 GAMELOG_TIMEOUT = 12
 GAMELOG_RETRIES = 2
 
-Z_ONE_SIDED_90 = 1.2815515655446004
+# one-sided z scores
+Z = {
+    0.70: 0.5244005127080409,
+    0.80: 0.8416212335729143,
+    0.90: 1.2815515655446004,
+}
 
-MIN_GAMES_FOR_VOL = 5
 MIN_SCALE = 0.70
 MAX_SCALE = 1.30
-
-# Must match optimizer app gist filenames
-GIST_FINAL = "final.csv"
-GIST_OUT = "out.json"
 
 # ==========================
 # PAGE
 # ==========================
 st.set_page_config(layout="wide")
-st.title("Props App — 90% Floors (Auto-load from Optimizer)")
+st.title("Confidence Floors (70/80/90%) — from Optimizer Projections")
 
-st.markdown(
-    """
-This app auto-loads your projections from the **Optimizer app** so you only mark OUT players once.
+st.markdown("""
+This builds one-sided **confidence floors**:
+> “With X% confidence, player gets at least ___”
 
-Workflow:
-1) In Optimizer app: Upload slate → mark OUT → Run Projections  
-2) Here: Load `final.csv` + `out.json` from the same Gist → Build 90% floors
-"""
-)
+Pulled from your optimizer `final.csv` + minutes-adjusted volatility from this season’s game logs.
+""")
 
 # ==========================
 # HELPERS
@@ -84,15 +83,21 @@ def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 # ==========================
-# GIST READ
+# GIST
 # ==========================
-def gh_headers(token: str):
-    return {"Authorization": f"token {token}"}
+GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
+GIST_ID = st.secrets["GIST_ID"]
 
-def gist_read(gist_id: str, token: str, filename: str):
-    r = requests.get(f"https://api.github.com/gists/{gist_id}", headers=gh_headers(token), timeout=25)
+def gh_headers():
+    return {"Authorization": f"token {GITHUB_TOKEN}"}
+
+def gist_get():
+    r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=gh_headers(), timeout=25)
     r.raise_for_status()
-    g = r.json()
+    return r.json()
+
+def gist_read(filename: str):
+    g = gist_get()
     if filename not in g.get("files", {}):
         return None
     f = g["files"][filename]
@@ -113,8 +118,7 @@ def league_player_df():
         timeout=LEAGUE_TIMEOUT
     ).get_data_frames()[0]
 
-    keep = ["PLAYER_ID", "PLAYER_NAME"]
-    df = df[keep].copy()
+    df = df[["PLAYER_ID", "PLAYER_NAME"]].copy()
     df.columns = ["PLAYER_ID", "NBA_Name"]
     df["NBA_Name_clean"] = df["NBA_Name"].apply(clean_name)
     df["NBA_Name_stripped"] = df["NBA_Name"].apply(strip_suffix)
@@ -153,10 +157,9 @@ def match_player_id(name: str, nba_df: pd.DataFrame):
     return None
 
 @st.cache_data(ttl=3600)
-def player_rates_volatility(player_id: int, last_n: int):
+def pull_pm_volatility(player_id: int, last_n: int):
     """
-    Per-minute σ for PTS/REB/AST/FG3M from last_n games.
-    Returns avg_min for scaling.
+    Returns per-minute σ for PTS/REB/AST/FG3M and avg minutes in the sample.
     """
     last_err = None
     for attempt in range(1, GAMELOG_RETRIES + 1):
@@ -185,160 +188,184 @@ def player_rates_volatility(player_id: int, last_n: int):
             avg_min = float(gl["MIN_f"].mean())
             games = int(len(gl))
             out = {"avg_min": avg_min, "games": games}
-
             for c in ["PTS","REB","AST","FG3M"]:
                 out[f"pm_sigma_{c}"] = float(gl[f"PM_{c}"].std(ddof=1)) if games >= 2 else 0.0
             return out
         except Exception as e:
             last_err = str(e)
-            time.sleep(0.4 * attempt)
+            time.sleep(0.35 * attempt)
     return None
 
 # ==========================
-# SIDEBAR
+# LOAD PROJECTIONS FROM OPTIMIZER
 # ==========================
-st.sidebar.subheader("Source")
-source = st.sidebar.radio("Load from:", ["Optimizer Gist (recommended)", "Upload projections CSV"], index=0)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Volatility Settings")
-last_n = st.sidebar.slider("Use last N games", 5, 30, 15, 1)
-min_games = st.sidebar.slider("Minimum games required", 3, 15, 5, 1)
-min_sigma_pm = st.sidebar.slider("Minimum per-minute σ floor", 0.0, 0.50, 0.02, 0.01)
-
-# ==========================
-# LOAD PROJECTIONS
-# ==========================
-proj = None
-out_set = set()
-
-if source == "Optimizer Gist (recommended)":
-    if "GITHUB_TOKEN" not in st.secrets or "GIST_ID" not in st.secrets:
-        st.error("This mode requires GITHUB_TOKEN and GIST_ID in Streamlit secrets.")
-        st.stop()
-
-    final_text = gist_read(st.secrets["GIST_ID"], st.secrets["GITHUB_TOKEN"], GIST_FINAL)
-    if not final_text:
-        st.error("Could not load final.csv from Gist. Run projections in optimizer first.")
-        st.stop()
-
-    proj = pd.read_csv(StringIO(final_text))
-
-    out_text = gist_read(st.secrets["GIST_ID"], st.secrets["GITHUB_TOKEN"], GIST_OUT)
-    if out_text:
-        try:
-            out_flags = json.loads(out_text)
-            out_set = {k for k, v in out_flags.items() if v}
-        except Exception:
-            out_set = set()
-
-else:
-    up = st.sidebar.file_uploader("Upload projections CSV", type="csv")
-    if not up:
-        st.info("Upload a projections CSV to begin.")
-        st.stop()
-    proj_text = up.getvalue().decode("utf-8", errors="ignore")
-    proj = pd.read_csv(StringIO(proj_text))
-
-# Validate needed columns
-needed = ["Name", "Minutes", "PTS", "REB", "AST", "FG3M"]
-missing = [c for c in needed if c not in proj.columns]
-if missing:
-    st.error(f"Projections file missing required columns: {missing}")
+final_text = gist_read(GIST_FINAL)
+if not final_text:
+    st.error("Could not load final.csv from the optimizer. Run Step B in optimizer first.")
     st.stop()
 
-# Remove OUT players if they exist in projection file
+proj = pd.read_csv(StringIO(final_text))
+
+needed = ["Name", "Salary", "Minutes", "PTS", "REB", "AST", "FG3M"]
+missing = [c for c in needed if c not in proj.columns]
+if missing:
+    st.error(f"final.csv is missing required columns: {missing}")
+    st.stop()
+
 proj["Name_clean"] = proj["Name"].apply(clean_name)
+proj["Salary"] = pd.to_numeric(proj["Salary"], errors="coerce")
+proj["Minutes"] = pd.to_numeric(proj["Minutes"], errors="coerce")
+
+# remove OUT players (if present)
+out_set = set()
+out_text = gist_read(GIST_OUT)
+if out_text:
+    try:
+        out_flags = json.loads(out_text)
+        out_set = {k for k, v in out_flags.items() if v}
+    except Exception:
+        out_set = set()
+
 if out_set:
     proj = proj[~proj["Name_clean"].isin(out_set)].copy()
 
-proj["Minutes"] = pd.to_numeric(proj["Minutes"], errors="coerce").fillna(0.0)
-
-st.subheader("Projections Loaded")
-st.dataframe(proj[["Name","Team","Opp","PrimaryPos","Salary","Minutes","PTS","REB","AST","FG3M"]].head(50), use_container_width=True)
-
 # ==========================
-# BUILD FLOORS
+# SETTINGS
 # ==========================
-if not st.button("Build 90% floors for slate"):
+st.sidebar.subheader("Volatility")
+last_n = st.sidebar.slider("Use last N games", 5, 30, 15, 1)
+min_sigma_pm = st.sidebar.slider("Minimum per-minute σ floor", 0.0, 0.50, 0.02, 0.01)
+
+st.sidebar.subheader("Selection Rules")
+top50_salary = 50
+top25_reb = 25
+top25_ast = 25
+
+# Build sets (unique players)
+top_salary_df = proj.dropna(subset=["Salary"]).sort_values("Salary", ascending=False).head(top50_salary).copy()
+top_reb_df = proj.dropna(subset=["REB"]).sort_values("REB", ascending=False).head(top25_reb).copy()
+top_ast_df = proj.dropna(subset=["AST"]).sort_values("AST", ascending=False).head(top25_ast).copy()
+
+need_names = set(top_salary_df["Name_clean"]) | set(top_reb_df["Name_clean"]) | set(top_ast_df["Name_clean"])
+
+st.write(f"Will compute volatility for **{len(need_names)} unique players** (Top 50 salary + Top 25 REB + Top 25 AST).")
+
+if not st.button("Build 70/80/90% floors"):
+    st.dataframe(proj[["Name","Salary","Minutes","PTS","REB","AST","FG3M"]].head(30), use_container_width=True)
     st.stop()
 
 nba_df = league_player_df()
 
-rows = []
-progbar = st.progress(0, text="Computing minutes-adjusted volatility...")
+# Precompute volatility for needed players only
+vol_map = {}  # name_clean -> vol dict + player_id
+progbar = st.progress(0, text="Pulling game logs for selected players...")
 
-for i, r in proj.iterrows():
-    name = str(r["Name"])
-    progbar.progress((i + 1) / len(proj), text=f"{name} ({i+1}/{len(proj)})")
+need_list = sorted(list(need_names))
+for i, nm in enumerate(need_list):
+    name = proj.loc[proj["Name_clean"] == nm, "Name"].iloc[0]
+    progbar.progress((i + 1) / len(need_list), text=f"{name} ({i+1}/{len(need_list)})")
 
     pid = match_player_id(name, nba_df)
     if pid is None:
-        rows.append({"Name": name, "Status": "ERR_NAME", "Notes": "Could not match name"})
+        vol_map[nm] = {"status": "ERR_NAME"}
         continue
 
-    mu_min = float(r["Minutes"]) if np.isfinite(r["Minutes"]) else 0.0
-    if mu_min <= 0:
-        rows.append({"Name": name, "Status": "ERR_MIN", "Notes": "No projected minutes"})
-        continue
+    v = pull_pm_volatility(pid, last_n=last_n)
+    time.sleep(0.12)  # tiny throttle helps cloud/rate-limits
+    if v is None:
+        vol_map[nm] = {"status": "ERR_LOGS"}
+    else:
+        v["status"] = "OK"
+        v["player_id"] = pid
+        vol_map[nm] = v
 
-    # mean projections from optimizer app
-    mu = {
-        "PTS": float(r["PTS"]),
-        "REB": float(r["REB"]),
-        "AST": float(r["AST"]),
-        "FG3M": float(r["FG3M"]),
-    }
+def make_floor_table(df_in: pd.DataFrame, stats: list, title: str):
+    df = df_in.copy()
+    rows = []
+    for _, r in df.iterrows():
+        nm = r["Name_clean"]
+        v = vol_map.get(nm, {"status": "ERR"})
+        if v.get("status") != "OK":
+            rows.append({
+                "Name": r["Name"],
+                "Team": r.get("Team",""),
+                "Opp": r.get("Opp",""),
+                "Salary": r.get("Salary", np.nan),
+                "ProjMin": r.get("Minutes", np.nan),
+                "Status": v.get("status","ERR"),
+            })
+            continue
 
-    vol = player_rates_volatility(pid, last_n=last_n)
-    if vol is None or vol.get("games", 0) < int(min_games):
-        rows.append({"Name": name, "Status": "ERR_LOGS", "Notes": f"Need >= {min_games} games for σ"})
-        continue
+        mu_min = float(r["Minutes"]) if np.isfinite(r["Minutes"]) else 0.0
+        if mu_min <= 0:
+            rows.append({
+                "Name": r["Name"],
+                "Team": r.get("Team",""),
+                "Opp": r.get("Opp",""),
+                "Salary": r.get("Salary", np.nan),
+                "ProjMin": r.get("Minutes", np.nan),
+                "Status": "ERR_MIN",
+            })
+            continue
 
-    avg_min_sample = float(vol["avg_min"]) if vol.get("avg_min") else mu_min
-    scale = clamp(mu_min / max(avg_min_sample, 1e-6), MIN_SCALE, MAX_SCALE)
+        avg_min = float(v.get("avg_min", mu_min))
+        scale = clamp(mu_min / max(avg_min, 1e-6), MIN_SCALE, MAX_SCALE)
 
-    out = {
-        "Name": name,
-        "Team": r.get("Team",""),
-        "Opp": r.get("Opp",""),
-        "PrimaryPos": r.get("PrimaryPos",""),
-        "Salary": r.get("Salary", np.nan),
-        "ProjMin": round(mu_min, 2),
-        "VolGames": int(vol["games"]),
-        "Status": "OK",
-        "Notes": f"VOL(last{last_n}) scale={scale:.2f}"
-    }
+        out = {
+            "Name": r["Name"],
+            "Team": r.get("Team",""),
+            "Opp": r.get("Opp",""),
+            "Salary": r.get("Salary", np.nan),
+            "ProjMin": round(mu_min, 1),
+            "VolGames": int(v.get("games", 0)),
+            "Status": "OK",
+        }
 
-    for stat in ["PTS","REB","AST","FG3M"]:
-        pm_sigma = float(vol.get(f"pm_sigma_{stat}", 0.0))
-        pm_sigma = max(pm_sigma, float(min_sigma_pm))
+        for stat in stats:
+            mu = float(r[stat])
+            pm_sigma = float(v.get(f"pm_sigma_{stat}", 0.0))
+            pm_sigma = max(pm_sigma, float(min_sigma_pm))
+            sigma_adj = pm_sigma * np.sqrt(mu_min) * scale
 
-        # minutes-adjusted σ: per-minute σ scaled by sqrt(minutes) and role-change scale
-        sigma = pm_sigma * np.sqrt(mu_min) * scale
+            out[f"{stat}_Proj"] = round(mu, 2)
+            out[f"{stat}_SigmaAdj"] = round(sigma_adj, 2)
 
-        floor90 = float(mu[stat]) - Z_ONE_SIDED_90 * float(sigma)
+            for p, z in Z.items():
+                out[f"{stat}_Floor{int(p*100)}"] = round(mu - z * sigma_adj, 2)
 
-        out[f"{stat}_Proj"] = round(float(mu[stat]), 2)
-        out[f"{stat}_SigmaAdj"] = round(float(sigma), 2)
-        out[f"{stat}_Floor90"] = round(float(floor90), 2)
+        rows.append(out)
 
-    rows.append(out)
+    out_df = pd.DataFrame(rows)
+    st.subheader(title)
+    st.dataframe(out_df, use_container_width=True)
 
-props = pd.DataFrame(rows)
+    csv_bytes = out_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        f"Download {title} CSV",
+        data=csv_bytes,
+        file_name=re.sub(r"[^a-zA-Z0-9]+", "_", title).strip("_").lower() + ".csv",
+        mime="text/csv"
+    )
 
-st.subheader("90% Floors (Auto from Optimizer Projections)")
-st.dataframe(props, use_container_width=True)
-
-csv_bytes = props.to_csv(index=False).encode("utf-8")
-st.download_button(
-    "Download floors CSV",
-    data=csv_bytes,
-    file_name="props_floor90_from_optimizer.csv",
-    mime="text/csv"
+# TABLE 1: Top 50 salary → PTS + FG3M floors
+make_floor_table(
+    top_salary_df,
+    stats=["PTS","FG3M"],
+    title="Top 50 Salary — Points + 3PM Floors (70/80/90%)"
 )
 
-st.caption(
-    "These floors use your optimizer projections as the mean (μ) and minutes-adjusted volatility (σ) from recent games."
+# TABLE 2: Top 25 projected REB → REB floors
+make_floor_table(
+    top_reb_df,
+    stats=["REB"],
+    title="Top 25 Projected Rebounds — REB Floors (70/80/90%)"
 )
 
+# TABLE 3: Top 25 projected AST → AST floors
+make_floor_table(
+    top_ast_df,
+    stats=["AST"],
+    title="Top 25 Projected Assists — AST Floors (70/80/90%)"
+)
+
+st.caption("Floor70/80/90 are one-sided floors: projected to exceed that value about 70/80/90% of the time under this model.")
